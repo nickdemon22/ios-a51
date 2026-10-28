@@ -849,3 +849,55 @@ zaps it. Result: `/sys/fs/pstore/dmesg-ramoops-0`. This is the evidence channel
 for every later stage, including the XNU early console.
 
 ---
+
+## Phases 5–9: iOS 16 userland on the A51 (2026-10-28/29) — lock screen, touch, USB, SSH
+
+Device: SM-A515F, S-Boot `A515FXXU8HWI1`, TWRP 3.7.1 in recovery. Boot images are
+written to boot (sda12) and verified by readback; the iOS root lives in userdata
+(sda32, Android erased with the owner's consent). Host scripts:
+`tools/a51/host/` (see its README). Kernel patches 0126–0137 build in CI
+(`xnu.yml`); the loader is `shim/a51` built with
+`CROSS=aarch64-linux-gnu- EXTRA_CFLAGS="-DDEADMAN_MS=900000UL -DDEADMAN_MPIDR=0x103UL"`.
+
+| Boot | Result | Key change |
+|---|---|---|
+| 12 | XNU to "platform expert registered", AppleCLCD 1080x2400 | shim dead-man timer: CPU1 (PSCI CPU_ON after GICD_CTLR enable; Samsung PSCI does not pass the context id) warm-resets into TWRP via PMU INFORM + SWRESET, so pstore keeps the XNU console |
+| 14 | sweet_ufs finds userdata, reads its superblock | read-only `rd=ufsroot0 ufsroot=userdata` |
+| 15 | iOS 16.7.16 root mounts, launchd + ~290 xpcproxy launches | 16 GiB HFS+ root (`build-ios-root.sh`), `ufsrw=1 rootrw=1 launchd_unsecure_cache=1` |
+| 16 | Apple logo on the panel | 0126: DECON command mode needs a software trigger after each copy |
+| 19, 23 | 7/7 CPUs, no panic | 0127 (plain PSCI CPU_ON via the low trampoline), 0129 + ADT: one cluster (a second pset panicked "ticket lock unexpectedly owned") |
+| 26/27 | **lock screen** | ADT identity (serial number, wlan/bluetooth MACs): without them lsd blocks in MGCopyAnswer(UniqueDeviceID); now in `mkadt_a51.py`. Boot-args `a5fb_noconsole=1 a5fb_keep_on=1` |
+| 33 | **unlocked by touch** | 0131 Melfas MSS100 on the classic IIC 0x13870000 (gpg3-1 power), 0132 wake on first touch |
+| 38 | **USB gadget** (1209:0001 "Sweet iOS (USB Ethernet)"), live kernel log over UDP | 0130 DWC3 + HS PHY bring-up, MUIC switch (`shim/a51/muic.c`); 0137: the A51 kernel's `phy_exynos_usb_v3p1_pipe_ovrd` (USBCON LINK_CTRL bits 16, 18 set, 17 clear; 0x48 bit 4). Without it the DWC3 never pulls D+ up (LINESTATE SE0) |
+| 39 | **SSH** as root over USB (192.168.7.2) | `tools/sweet-root-ssh.py`, see below |
+
+Touch recovery gesture (0133): holding the top-left corner (x, y < 100) for
+3 s warm-resets into TWRP, so no button combination is needed.
+
+### SSH (measured)
+
+- Procursus (dists/1900, rootless) packages under `/private/var/jb`, ad-hoc
+  signed, accepted by the A5XELTE AMFI policy. `tools/procursus-tree.py`
+  resolves the closure, stops on missing dependencies and checks every Mach-O
+  link: Procursus' dropbear needs libtomcrypt1, which the index lacks
+  (crash loop "Library not loaded: @rpath/libtomcrypt.1.dylib"), so OpenSSH
+  9.7p1 is used.
+- Procursus binaries resolve users with libiosexec (`ie_getpwnam`), which
+  reads only `/var/jb/etc/{spwd.db,pwd.db,group}`, never `/etc`. Without
+  those, root is an invalid user and every login is refused (sshd still
+  starts: its config has `UsePrivilegeSeparation no`). The sshd job runs
+  `pwd_mkdb` first. Apple's own lookups (Libinfo) are not involved.
+- iOS is reset, not shut down, so its HFS+ journal holds transactions; Linux
+  never replays them. `tools/hfs-journal-replay.py` replays them (as XNU does)
+  before the image is edited; hfsprogs 540 fsck wrongly reports the
+  little-endian journal as empty.
+- Edits go through `sync-userdata.py`: only 64 MiB chunks that differ are
+  pulled/pushed (a pull is ~8 min of hashing on the phone).
+
+### Known issues / next
+
+- UI is slow: CoreAnimation renders on the CPU; frames are copied to the
+  DECON command-mode framebuffer (`sweetfb_hz`). GPU (Mali-G72 MP3) is next.
+- locationd, WirelessRadioManagerd, PosterBoard crash (no baseband, Wi-Fi,
+  GPU); usermanagerd fails its multi-user setup ("FAILED to Set Foreground ID").
+- One core (MPIDR 0x103) is kept for the dead-man timer (`cpus=7`).

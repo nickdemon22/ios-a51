@@ -1,0 +1,50 @@
+A51: one cluster (one pset) for all eight cores.
+
+0115 routes A5XELTE through the HAS_CLUSTER topology path, which derives the
+cluster from MPIDR. On the A51 the A73s (MPIDR 0x100-0x103, Aff1 = 1) then
+become cluster 1 with their own processor set, and this non-AMP scheduler
+panics on pset0's ticket lock ("Ticket lock ... is unexpectedly owned by
+thread", lck_ticket_contended) as soon as cpus >= 5, even before any A73 is
+started. cpus=2 and cpus=4 (A53 cluster only) boot cleanly into iOS.
+
+SWEET (A55+A76) and HEROLTE (A53+Mongoose) run eight cores with the stock
+non-cluster path, where every core is CLUSTER_TYPE_SMP cluster 0. Do the same
+for the A51; A5XELTE boards other than the A51 keep 0115's behaviour.
+
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 6d56a33..8b6dbf1 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1050,7 +1050,13 @@ ml_parse_cpu_topology(void)
+ 		 * on the value provided by EDT. Instead, use the MPIDR value to see if we have
+ 		 * seen this exact cluster before. If so, then reuse that cluster ID for this CPU.
+ 		 */
+-#if HAS_CLUSTER || defined(A5XELTE)
++		/*
++		 * A51: one cluster (one pset) for all eight cores, like the SWEET and
++		 * HEROLTE 8-core configurations. With the A73s (MPIDR Aff1 = 1) as a
++		 * second pset this non-AMP scheduler panics on pset0's ticket lock
++		 * ("unexpectedly owned") as soon as cpus >= 5 (boots 17b, 21, 22).
++		 */
++#if HAS_CLUSTER || (defined(A5XELTE) && !defined(A51))
+ 		uint32_t phys_cluster_id = MPIDR_CLUSTER_ID(cpu->phys_id);
+ #else
+ 		uint32_t phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P);
+@@ -1084,7 +1090,7 @@ ml_parse_cpu_topology(void)
+ 			ml_read_reg_range(child, "cpm-impl-reg", &cluster->cpm_IMPL_pa, &cluster->cpm_IMPL_len);
+ 		}
+ 
+-#if HAS_CLUSTER || defined(A5XELTE)
++#if HAS_CLUSTER || (defined(A5XELTE) && !defined(A51))
+ 		if (MPIDR_CPU_ID(cpu->phys_id) > cluster_max_cpu_phys_id[phys_cluster_id]) {
+ 			cluster_max_cpu_phys_id[phys_cluster_id] = MPIDR_CPU_ID(cpu->phys_id);
+ 		}
+@@ -1110,7 +1116,7 @@ ml_parse_cpu_topology(void)
+ 
+ 	}
+ 
+-#if HAS_CLUSTER || defined(A5XELTE)
++#if HAS_CLUSTER || (defined(A5XELTE) && !defined(A51))
+ 	/*
+ 	 * Build the cluster offset array, ensuring that the region reserved
+ 	 * for each physical cluster contains enough entries to be indexed

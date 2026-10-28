@@ -1,0 +1,309 @@
+A51: USB device mode and live log (sweet_usb.c on the Exynos 9611).
+
+Enables the SWEET USB gadget (0072-0077, 0081: DWC3 device mode, CDC-ECM
+interface ue0 at 192.168.7.2, kernel log as UDP to 192.168.7.1:5140, host side
+tools/sweet-usbnet.sh) on the Galaxy A51.
+
+A shim/a51 read-only probe on a second SM-A515F showed S-Boot leaves the DWC3
+at 0x13200000 clocked, in device mode and halted, like ABL on sweet:
+GSNPSID 0x5533310a (v3.10a), GCTL 0x30c12004 (PRTCAPDIR 2), DSTS 0x00530434
+(DEVCTRLHLT), USBCON PHY at 0x131d0000 readable. So only three things change:
+- addresses: DWC3 0x13200000 (live DT usb@13200000), no GCC checks;
+- VBUS: the board has no VBUS pad (DT is_not_vbus_pad), so VBUS-valid and the
+  D+ pull-up are forced in the USBCON PHY instead of Qualcomm's QSCRATCH:
+  LINK_CTRL |= BUS_FILTER_BYPASS(0xf), UTMI |= FORCE_BVALID|FORCE_VBUSVALID,
+  HSP |= VBUSVLDEXTSEL|VBUSVLDEXT, the not_used_vbus_pad path of Samsung's
+  Exynos 9610 bootloader (lk3rd platform/maestro9610/fastboot/
+  phy-exynos-usb3p1.c);
+- call site: sweet_ufs_init() calls sweet_usb_probe() on A5XELTE as well;
+  other A5XELTE boards stay off. Boot-arg sweetusb=2 starts the gadget,
+Boot 27 then timed out on the first SETEPCONFIG ("ep0 cmd 0x1 timeout"): in a
+normal boot S-Boot leaves the DWC3 clocked but not the HS PHY (LINK_CTRL
+FORCE_QACT clear, PMU USB PHY control 0x11860704 = 0x00010000). So the A51
+path first releases the PMU isolation (pmu_mask 0x3, Samsung
+exynos_usbdrd_phy_isol(on = 0)) and runs the HS power-up of USBCON v3.0 from
+the same bootloader (phy_exynos_usb_v3p1_enable): force q-channel, link
+reset, PHY reset high, SIDDQ off, UTMI suspend/sleep/pulldowns off, PHY
+Boot 28 with the PHY powered still never connected (DSTS running, no host
+event). Add the DWC3 side of the same bring-up (lk3rd usbd3-ss.c): hold
+GUSB2PHYCFG.PHYSOFTRST while the PHY powers up, clear SUSPHY/ENBLSLPM and
+U2_FREECLK_EXISTS (DT snps,dis-u2-freeclk-exists-quirk), clear
+GUSB3PIPECTL.SUSPHY, pulse GCTL.CORESOFTRESET with U2RSTECN, then
+GSBUSCFG0 0x22220000|INCR16 and USBTRDTIM 9.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ea1d3c1..d72a36d 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -724,6 +724,9 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/* A51: USB device and live log (bsd/dev/sweet_usb.c, boot-arg sweetusb). */
++	sweet_usb_probe();
+ #endif
+ 	return 0;
+ }
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..df261d1 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -10,7 +10,7 @@
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+  * power domain and clocks are on (an access to a gated block would hang).
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+@@ -36,6 +36,7 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <pexpert/arm64/board_config.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -60,8 +61,51 @@ static const struct {
+ 	{ "clkref", 0x8c010 },
+ };
+ 
++#if defined(A51)
++/*
++ * Galaxy A51 (Exynos 9611): DWC3 v3.10a at 0x13200000 (live DT usb@13200000,
++ * GSNPSID 0x5533310a), Samsung USBCON v3.0 PHY at 0x131d0000. S-Boot leaves
++ * the DWC3 clocked, in device mode (GCTL.PRTCAPDIR 2) and halted, like ABL
++ * on sweet (shim/a51 USB probe). The board has no VBUS pad
++ * (is_not_vbus_pad), so VBUS-valid is forced in the PHY, as Samsung's 9610
++ * bootloader does (lk3rd platform/maestro9610/fastboot/phy-exynos-usb3p1.c,
++ * not_used_vbus_pad).
++ */
++#define DWC3_PA                 0x13200000
++#define DWC3_SIZE               0x00010000
++#define USBCON_PA               0x131d0000
++#define USBCON_SIZE             0x00000100
++#define USBCON_LINK_CTRL        0x04
++#define LINKCTRL_BUS_FILTER_BYPASS_ALL  (0xfu << 4)
++#define USBCON_UTMI             0x50
++#define UTMI_FORCE_VBUSVALID    (1u << 5)
++#define UTMI_FORCE_BVALID       (1u << 4)
++#define USBCON_HSP              0x54
++#define HSP_VBUSVLDEXTSEL       (1u << 13)
++#define HSP_VBUSVLDEXT          (1u << 12)     /* also the D+ pull-up control */
++#define HSP_EN_UTMISUSPEND      (1u << 9)
++#define HSP_COMMONONN           (1u << 8)
++#define USBCON_CLKRST           0x20
++#define CLKRST_PHY_SW_RST       (1u << 3)
++#define CLKRST_PHY_RST_SEL      (1u << 2)
++#define CLKRST_PORT_RST         (1u << 1)
++#define CLKRST_LINK_SW_RST      (1u << 0)
++#define USBCON_HSP_TEST         0x5c
++#define HSP_TEST_SIDDQ          (1u << 24)     /* HS PHY power down */
++#define LINKCTRL_DIS_QACT_ALL   ((1u << 12) | (1u << 11) | (1u << 10) | (1u << 9))
++#define LINKCTRL_FORCE_QACT     (1u << 8)
++#define UTMI_DP_PULLDOWN        (1u << 3)
++#define UTMI_DM_PULLDOWN        (1u << 2)
++#define UTMI_FORCE_SUSPEND      (1u << 1)
++#define UTMI_FORCE_SLEEP        (1u << 0)
++/* PMU USB PHY control (live DT pmu_offset 0x704, pmu_mask 0x3): set = PHY
++ * isolation released (Samsung exynos_usbdrd_phy_isol(on = 0)). */
++#define PMU_USB_PHY_CTRL_PA     0x11860704
++#define PMU_USB_PHY_ENABLE      0x3u
++#else
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
++#endif
+ #define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
+ 
+@@ -82,9 +126,22 @@ sweet_usb_probe(void)
+ 
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && !defined(A51)
++	enabled = 0;    /* only the A51 USB addresses are known on this config */
++#endif
+ 	if (!enabled) {
+ 		return;
+ 	}
++#if defined(A51)
++	(void)gdscr;
++	(void)cbcr;
++	(void)clocks_on;
++	vm_offset_t usbcon = ml_io_map(USBCON_PA, USBCON_SIZE);
++	if (usbcon != 0) {
++		printf("SWEET USB: A51 USBCON LINK_CTRL 0x%08x UTMI 0x%08x HSP 0x%08x\n",
++		    usb_rd(usbcon, USBCON_LINK_CTRL), usb_rd(usbcon, USBCON_UTMI), usb_rd(usbcon, USBCON_HSP));
++	}
++#else
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+@@ -103,6 +160,7 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
+ 		return;
+ 	}
++#endif
+ 	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
+ 	if (dwc == 0) {
+ 		printf("SWEET USB: DWC3 map failed\n");
+@@ -119,6 +177,7 @@ sweet_usb_probe(void)
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
++#if !defined(A51)
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+@@ -132,6 +191,7 @@ sweet_usb_probe(void)
+ 	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+ 	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+ 	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++#endif /* !A51 */
+ }
+ 
+ /*
+@@ -147,6 +207,15 @@ sweet_usb_probe(void)
+  * ep0.c).
+  */
+ #define GCTL            0xc110
++#define GCTL_CORESOFTRESET      (1u << 11)
++#define GCTL_U2RSTECN           (1u << 16)
++#define GUSB2PHYCFG     0xc200
++#define GUSB2PHYCFG_PHYSOFTRST  (1u << 31)
++#define GUSB2PHYCFG_U2_FREECLK_EXISTS (1u << 30)
++#define GUSB2PHYCFG_ENBLSLPM    (1u << 8)
++#define GUSB2PHYCFG_SUSPHY      (1u << 6)
++#define GUSB3PIPECTL    0xc2c0
++#define GUSB3PIPECTL_SUSPHY     (1u << 17)
+ #define GEVNTADRLO      0xc400
+ #define GEVNTADRHI      0xc404
+ #define GEVNTSIZ        0xc408
+@@ -848,6 +917,75 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++#if defined(A51)
++static void
++usbcon_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * S-Boot leaves the DWC3 clocked but not the HS PHY: boot 27 timed out on the
++ * first SETEPCONFIG (no UTMI clock) with LINK_CTRL.FORCE_QACT clear and the
++ * PMU PHY control at 0x00010000. Power the PHY up as Samsung's Exynos 9610
++ * bootloader does (lk3rd maestro9610 phy_exynos_usb_v3p1_enable, HS path
++ * of USBCON v3.0, not_used_vbus_pad), after releasing the PMU isolation.
++ */
++static void
++a51_usb_phy_enable(void)
++{
++	vm_offset_t pmu = ml_io_map(trunc_page(PMU_USB_PHY_CTRL_PA), PAGE_SIZE);
++	vm_offset_t u = ml_io_map(USBCON_PA, USBCON_SIZE);
++	uint32_t r;
++
++	if (pmu == 0 || u == 0) {
++		printf("SWEET USB: A51 PHY map failed\n");
++		return;
++	}
++	volatile uint32_t *pmuctl = (volatile uint32_t *)(pmu + (PMU_USB_PHY_CTRL_PA & PAGE_MASK));
++	printf("SWEET USB: A51 PHY before: PMU 0x%08x LINK_CTRL 0x%08x CLKRST 0x%08x UTMI 0x%08x HSP 0x%08x HSP_TEST 0x%08x\n",
++	    *pmuctl, usb_rd(u, USBCON_LINK_CTRL), usb_rd(u, USBCON_CLKRST), usb_rd(u, USBCON_UTMI),
++	    usb_rd(u, USBCON_HSP), usb_rd(u, USBCON_HSP_TEST));
++	*pmuctl |= PMU_USB_PHY_ENABLE;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(10);
++
++	/* Force the q-channel active (keeps the link clock ungated). */
++	r = usb_rd(u, USBCON_LINK_CTRL) | LINKCTRL_DIS_QACT_ALL;
++	r &= ~LINKCTRL_FORCE_QACT;
++	delay(500);
++	usbcon_wr(u, USBCON_LINK_CTRL, r);
++	delay(500);
++	usbcon_wr(u, USBCON_LINK_CTRL, usb_rd(u, USBCON_LINK_CTRL) | LINKCTRL_FORCE_QACT);
++	delay(500);
++	/* Link reset */
++	r = usb_rd(u, USBCON_CLKRST);
++	usbcon_wr(u, USBCON_CLKRST, r | CLKRST_LINK_SW_RST);
++	delay(10);
++	usbcon_wr(u, USBCON_CLKRST, r & ~CLKRST_LINK_SW_RST);
++	/* PHY reset high, power on (SIDDQ off) */
++	usbcon_wr(u, USBCON_CLKRST, usb_rd(u, USBCON_CLKRST) | CLKRST_PHY_SW_RST | CLKRST_PHY_RST_SEL);
++	usbcon_wr(u, USBCON_HSP_TEST, usb_rd(u, USBCON_HSP_TEST) & ~HSP_TEST_SIDDQ);
++	usbcon_wr(u, USBCON_UTMI, usb_rd(u, USBCON_UTMI) &
++	    ~(UTMI_FORCE_SUSPEND | UTMI_FORCE_SLEEP | UTMI_DP_PULLDOWN | UTMI_DM_PULLDOWN));
++	/* PHY clock on, common block enabled (common_block_disable is not set) */
++	usbcon_wr(u, USBCON_HSP, (usb_rd(u, USBCON_HSP) | HSP_EN_UTMISUSPEND) & ~HSP_COMMONONN);
++	delay(100);
++	/* PHY reset low */
++	r = usb_rd(u, USBCON_CLKRST) | CLKRST_PHY_RST_SEL;
++	usbcon_wr(u, USBCON_CLKRST, r & ~(CLKRST_PHY_SW_RST | CLKRST_PORT_RST));
++	/* No VBUS pad: force VBUS-valid/B-valid and the D+ pull-up control. */
++	usbcon_wr(u, USBCON_LINK_CTRL, usb_rd(u, USBCON_LINK_CTRL) | LINKCTRL_BUS_FILTER_BYPASS_ALL);
++	usbcon_wr(u, USBCON_UTMI, usb_rd(u, USBCON_UTMI) | UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID);
++	usbcon_wr(u, USBCON_HSP, usb_rd(u, USBCON_HSP) | HSP_VBUSVLDEXTSEL | HSP_VBUSVLDEXT);
++	delay(1000);
++	printf("SWEET USB: A51 PHY after:  PMU 0x%08x LINK_CTRL 0x%08x CLKRST 0x%08x UTMI 0x%08x HSP 0x%08x HSP_TEST 0x%08x\n",
++	    *pmuctl, usb_rd(u, USBCON_LINK_CTRL), usb_rd(u, USBCON_CLKRST), usb_rd(u, USBCON_UTMI),
++	    usb_rd(u, USBCON_HSP), usb_rd(u, USBCON_HSP_TEST));
++}
++#endif
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+@@ -866,6 +1004,31 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
++#if defined(A51)
++	/*
++	 * DWC3 side of Samsung's 9610 bring-up (lk3rd usbd3-ss.c): hold the USB2
++	 * PHY interface in reset while the PHY powers up, take the PHYs out of
++	 * suspend, drop U2_FREECLK_EXISTS (DT snps,dis-u2-freeclk-exists-quirk),
++	 * then reset the whole core once the PHY clock runs. Boot 28 powered the
++	 * PHY and ran the device controller without these and never connected.
++	 */
++	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) | GUSB2PHYCFG_PHYSOFTRST);
++	a51_usb_phy_enable();
++	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) & ~GUSB2PHYCFG_PHYSOFTRST);
++	delay(75);
++	dwc_wr(GUSB2PHYCFG, dwc_rd(GUSB2PHYCFG) &
++	    ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM | GUSB2PHYCFG_U2_FREECLK_EXISTS));
++	dwc_wr(GUSB3PIPECTL, dwc_rd(GUSB3PIPECTL) & ~GUSB3PIPECTL_SUSPHY);
++	dwc_wr(GCTL, dwc_rd(GCTL) | GCTL_CORESOFTRESET | GCTL_U2RSTECN);
++	delay(1000);
++	dwc_wr(GCTL, dwc_rd(GCTL) & ~GCTL_CORESOFTRESET);
++	delay(1000);
++	/* Bus: cacheable/modifiable requests, INCR16 bursts (9610 bootloader). */
++	dwc_wr(0xc100 /* GSBUSCFG0 */, 0x22220000u | (1u << 3));
++	dwc_wr(GUSB2PHYCFG, (dwc_rd(GUSB2PHYCFG) & ~(0xfu << 10)) | (9u << 10));    /* USBTRDTIM 9 */
++	printf("SWEET USB: A51 core reset: GCTL 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x GSTS 0x%08x DSTS 0x%08x\n",
++	    dwc_rd(GCTL), dwc_rd(GUSB2PHYCFG), dwc_rd(GUSB3PIPECTL), dwc_rd(0xc118), dwc_rd(DSTS));
++#endif
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+@@ -902,7 +1065,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
++#if defined(A51)
++	vm_offset_t qs = 0;
++#else
+ 	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++#endif
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+@@ -928,4 +1095,4 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		thread_deallocate(thread);
+ 	}
+ }
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* ARM64_BOARD_CONFIG_SWEET || ARM64_BOARD_CONFIG_A5XELTE */

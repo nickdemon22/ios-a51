@@ -1,0 +1,43 @@
+A51 SMP: start secondaries with one plain PSCI CPU_ON via the low trampoline.
+
+0125 extended the S8 CPU_ON block to the A51. Its trampoline in the low bank
+(0x8f000000) is right for the A51 too (the kernel runs in the 0x88xxxxxxx
+bank), but its PMU power-up dance writes the S8 PMU at 0x16480000, which is
+not the Exynos 9611 PMU (0x11860000), and issues CPU_ON twice.
+
+On a second SM-A515F the shim's dead-man timer measured what the 9611's EL3
+needs (boots 11g-11k): with the GIC-400 distributor enabled, a single PSCI
+CPU_ON (0xc4000003) to a low entry starts the core at EL1; with GICD_CTLR = 0
+it returns 0 but the core never runs. The PSCI context id does not arrive in
+x0, which sweet_secondary_entry already ignores. XNU enables GICD_CTLR in
+pe_arm_init_interrupts before SweetCPU starts any core, so keep the
+trampoline and skip the S8 PMU block on the A51.
+
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 0cb0988..d217fdd 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -318,6 +318,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
+ 		    getCPUNumber(), (uint64_t)entry, tramp_pa);
+ 		entry = (vm_offset_t)tramp_pa;
++#if defined(DREAMLTE)
+ 		static vm_offset_t pmu;
+ 		if (pmu == 0) {
+ 			pmu = ml_io_map(0x16480000, 0x10000);
+@@ -343,6 +344,15 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		}
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\n",
+ 		    getCPUNumber(), rc0, cfg[0], cfg[1]);
++#endif /* DREAMLTE */
++		/*
++		 * A51: the S8 PMU block above (0x16480000) is not the 9611 PMU
++		 * (0x11860000), so it is skipped. On the 9611 a single PSCI CPU_ON
++		 * to a low entry starts the core once the GIC distributor is
++		 * enabled (shim/a51 dead-man boots 11g/11h), which XNU has done by
++		 * now; the context id is not delivered in x0, and
++		 * sweet_secondary_entry already ignores x0.
++		 */
+ 	}
+ #endif
+ 	__builtin_arm_dsb(DSB_SY);

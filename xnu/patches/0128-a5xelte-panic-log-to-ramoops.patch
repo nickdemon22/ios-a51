@@ -1,0 +1,54 @@
+A5XELTE: copy the panic log (backtraces) to the ramoops console.
+
+These boards have no gPanicBase ("debug_log_init: Error!! gPanicBase is still
+not initialized"), so debug_buf_size is 0 and debug_putc() drops every
+character of the panic log. The panic string still reaches the console, but
+the backtraces, task and thread lines after it do not: boot 17b on an A51
+ended at "Ticket lock ... is unexpectedly owned by thread ..." with nothing
+to say who took it. Send each panic-log character to klog_putc() as well
+(pexpert/arm/pe_serial.c, the pmsg ramoops copy the shim reads back).
+
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index 437adb1..aec20a6 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1654,6 +1654,10 @@ debug_mode_active(void)
+ void
+ debug_putc(char c)
+ {
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	extern void a5xelte_panic_putc(char c);
++	a5xelte_panic_putc(c);  /* pexpert/arm/pe_serial.c: no gPanicBase here */
++#endif
+ 	if ((debug_buf_size != 0) &&
+ 	    ((debug_buf_ptr - debug_buf_base) < (int)debug_buf_size)) {
+ 		*debug_buf_ptr = c;
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index fbf6fa9..a679cde 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -774,6 +774,24 @@ klog_putc(uint8_t c)
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * Panic log characters (osfmk/kern/debug.c debug_putc). These boards have no
++ * gPanicBase, so debug_buf_size is 0 and the backtraces, task and thread
++ * lines XNU writes after the panic string are otherwise dropped: copy them
++ * to the ramoops console as well.
++ */
++void
++a5xelte_panic_putc(char c)
++{
++#if (defined(DREAMLTE) || defined(A51))
++	klog_putc((uint8_t)c);
++#else
++	(void)c;
++#endif
++}
++#endif
++
+ static void
+ fbcon_clear_row(uint32_t row)
+ {

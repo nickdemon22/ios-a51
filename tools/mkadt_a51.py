@@ -65,18 +65,22 @@ def cpu_node(logical):
     """A51 is little-first: CPU0-3 are Cortex-A53, CPU4-7 Cortex-A73."""
     a53 = logical < 4
     mpidr = logical if a53 else 0x100 + (logical - 4)
-    cluster = 0 if a53 else 1
+    # One cluster for all eight cores (patch 0129): the A73s as cluster 1 give
+    # XNU a second pset, which this non-AMP scheduler cannot handle.
+    cluster = 0
     return [
         ('device_type', mkadt.cstr('cpu')),
-        ('compatible', mkadt.cstr('arm,cortex-a53' if a53 else 'arm,cortex-a73') +
+        # SweetCPU matches 'arm,cortex-a53' (IONameMatch); the A73s list it too.
+        ('compatible', (mkadt.cstr('arm,cortex-a53') if a53 else
+                        mkadt.cstr('arm,cortex-a73') + mkadt.cstr('arm,cortex-a53')) +
          mkadt.cstr('ARM,v8')),
         ('reg', mkadt.u32(mpidr)),
         ('cpu-id', mkadt.u32(logical)),
         ('cluster-id', mkadt.u32(cluster)),
         ('cluster-type', mkadt.u32(0)),
         ('die-cluster-id', mkadt.u32(cluster)),
-        ('cluster-core-id', mkadt.u32(logical % 4)),
-        ('l2-cache-id', mkadt.u32(cluster)),
+        ('cluster-core-id', mkadt.u32(logical)),
+        ('l2-cache-id', mkadt.u32(0 if a53 else 1)),
         ('l3-cache-id', mkadt.u32(0)),
         ('state', mkadt.cstr('running' if logical == 0 else 'stopped')),
         ('timebase-frequency', mkadt.u32(TIMEBASE)),
@@ -95,6 +99,13 @@ def build(canvas=(FB_W, FB_H), fb_phys=FB_PHYS):
     set_prop(root, 'compatible', mkadt.cstr('samsung,a51') +
              mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,exynos9610') +
              mkadt.cstr('AppleARM'))
+    # Device identity. Without a serial number and the wlan/bluetooth MACs
+    # (udid-version 1), MobileGestalt cannot answer UniqueDeviceID, lsd blocks
+    # in MGCopyAnswer and iOS never leaves the Apple logo. Synthetic values.
+    set_prop(root, 'serial-number', mkadt.cstr('F17A51XNU001'))
+    set_prop(root, 'mlb-serial-number', mkadt.cstr('F17A51XNU001MLB1'))
+    set_prop(root, 'model-number', mkadt.cstr('MQAX2'))
+    set_prop(root, 'region-info', mkadt.cstr('LL/A'))
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
@@ -130,6 +141,12 @@ def build(canvas=(FB_W, FB_H), fb_phys=FB_PHYS):
         ('canvas-width', mkadt.u32(canvas[0])),
         ('canvas-height', mkadt.u32(canvas[1])),
     ]))
+    # locally administered MACs, see the identity note above
+    for name, last in (('wlan', 1), ('bluetooth', 2)):
+        arm_io.children.append(mkadt.node(name, [
+            ('device_type', mkadt.cstr(name)),
+            ('local-mac-address', bytes([0x02, 0xa5, 0x51, 0, 0, last])),
+        ]))
 
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]

@@ -1,0 +1,70 @@
+A51 USB: bring the HS PHY up the way the A51's own kernel does.
+
+Boot 35 logged HSP_TEST.LINESTATE = SE0 for a whole minute with RUN_STOP set:
+the PHY never applied its D+ pull-up. The sequence from 0130 followed the
+Exynos 9610 bootloader (lk3rd). The A51's own kernel
+(map220v/kernel_samsung_a51-linux, drivers/phy/samsung/phy-exynos-usb3p1.c
+phy_exynos_usb_v3p1_enable) differs: with the PHY's POR held it clears the
+UTMI suspend/sleep/pull-downs and COMMONONN, waits 100 us, forces VBUS-valid
+and B-valid (bus filter bypass, UTMI, HSP), writes the HS tuning to HSP_TUNE,
+powers the PHY (SIDDQ off), waits 10 us, releases POR and waits 75 us. The
+bootloader version forced VBUS only after POR and never wrote HSP_TUNE. Use
+the kernel's order, with HSP_TUNE from the A51 DT usb_hs_tune (tx_vref 0xa,
+tx_rise 3, tx_res 3, tx_pre_emp 3, tx_hsxv 3, tx_fsls 3, rx_sqrx 7, otg 2,
+compdis 7).
+
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 59ef9ba..4dca5cd 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -91,6 +91,12 @@ static const struct {
+ #define CLKRST_PORT_RST         (1u << 1)
+ #define CLKRST_LINK_SW_RST      (1u << 0)
+ #define USBCON_HSP_TEST         0x5c
++#define USBCON_HSP_TUNE         0x58
++/* A51 live DT usb_hs_tune (device): tx_vref 0xa, tx_rise 3, tx_res 3,
++ * tx_pre_emp 3, tx_pre_emp_plus 0, tx_hsxv 3, tx_fsls 3, rx_sqrx 7, otg 2,
++ * compdis 7, as fields of HSP_TUNE (phy-exynos-usb3p1-reg.h). */
++#define A51_HSP_TUNE            ((0xau << 28) | (3u << 24) | (3u << 21) | (3u << 18) | \
++	                         (3u << 16) | (3u << 12) | (7u << 8) | (2u << 4) | 7u)
+ #define HSP_TEST_SIDDQ          (1u << 24)     /* HS PHY power down */
+ #define LINKCTRL_DIS_QACT_ALL   ((1u << 12) | (1u << 11) | (1u << 10) | (1u << 9))
+ #define LINKCTRL_FORCE_QACT     (1u << 8)
+@@ -984,21 +990,30 @@ a51_usb_phy_enable(void)
+ 	usbcon_wr(u, USBCON_CLKRST, r | CLKRST_LINK_SW_RST);
+ 	delay(10);
+ 	usbcon_wr(u, USBCON_CLKRST, r & ~CLKRST_LINK_SW_RST);
+-	/* PHY reset high, power on (SIDDQ off) */
++	/*
++	 * The rest follows the A51's own kernel (map220v/kernel_samsung_a51-linux
++	 * drivers/phy/samsung/phy-exynos-usb3p1.c phy_exynos_usb_v3p1_enable),
++	 * which differs from the 9610 bootloader version boots 28-35 used: VBUS
++	 * force, HSP_TUNE and power-on all happen while the PHY's POR is held,
++	 * then POR low and 75 us. Boot 35 showed LINESTATE SE0 throughout, i.e.
++	 * no D+ pull-up, with the bootloader order and no tuning.
++	 */
+ 	usbcon_wr(u, USBCON_CLKRST, usb_rd(u, USBCON_CLKRST) | CLKRST_PHY_SW_RST | CLKRST_PHY_RST_SEL);
+-	usbcon_wr(u, USBCON_HSP_TEST, usb_rd(u, USBCON_HSP_TEST) & ~HSP_TEST_SIDDQ);
+ 	usbcon_wr(u, USBCON_UTMI, usb_rd(u, USBCON_UTMI) &
+ 	    ~(UTMI_FORCE_SUSPEND | UTMI_FORCE_SLEEP | UTMI_DP_PULLDOWN | UTMI_DM_PULLDOWN));
+-	/* PHY clock on, common block enabled (common_block_disable is not set) */
+-	usbcon_wr(u, USBCON_HSP, (usb_rd(u, USBCON_HSP) | HSP_EN_UTMISUSPEND) & ~HSP_COMMONONN);
++	usbcon_wr(u, USBCON_HSP, usb_rd(u, USBCON_HSP) & ~HSP_COMMONONN);   /* common block on */
+ 	delay(100);
+-	/* PHY reset low */
+-	r = usb_rd(u, USBCON_CLKRST) | CLKRST_PHY_RST_SEL;
+-	usbcon_wr(u, USBCON_CLKRST, r & ~(CLKRST_PHY_SW_RST | CLKRST_PORT_RST));
+ 	/* No VBUS pad: force VBUS-valid/B-valid and the D+ pull-up control. */
+ 	usbcon_wr(u, USBCON_LINK_CTRL, usb_rd(u, USBCON_LINK_CTRL) | LINKCTRL_BUS_FILTER_BYPASS_ALL);
+ 	usbcon_wr(u, USBCON_UTMI, usb_rd(u, USBCON_UTMI) | UTMI_FORCE_BVALID | UTMI_FORCE_VBUSVALID);
+ 	usbcon_wr(u, USBCON_HSP, usb_rd(u, USBCON_HSP) | HSP_VBUSVLDEXTSEL | HSP_VBUSVLDEXT);
++	printf("SWEET USB: A51 HSP_TUNE 0x%08x -> 0x%08x\n", usb_rd(u, USBCON_HSP_TUNE), A51_HSP_TUNE);
++	usbcon_wr(u, USBCON_HSP_TUNE, A51_HSP_TUNE);
++	usbcon_wr(u, USBCON_HSP_TEST, usb_rd(u, USBCON_HSP_TEST) & ~HSP_TEST_SIDDQ);      /* power on */
++	delay(10);
++	r = usb_rd(u, USBCON_CLKRST) | CLKRST_PHY_RST_SEL;                 /* POR low */
++	usbcon_wr(u, USBCON_CLKRST, r & ~(CLKRST_PHY_SW_RST | CLKRST_PORT_RST));
++	delay(75);
+ 	delay(1000);
+ 	printf("SWEET USB: A51 PHY after:  PMU 0x%08x LINK_CTRL 0x%08x CLKRST 0x%08x UTMI 0x%08x HSP 0x%08x HSP_TEST 0x%08x\n",
+ 	    *pmuctl, usb_rd(u, USBCON_LINK_CTRL), usb_rd(u, USBCON_CLKRST), usb_rd(u, USBCON_UTMI),

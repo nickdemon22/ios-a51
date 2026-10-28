@@ -1,0 +1,89 @@
+A51: wake iOS's display with the first touch (no button driver yet).
+
+Boot 32 delivered clean swipes that iOS ignored: each came right after
+"A5XELTE FB: display-off request ignored (a5fb_keep_on)". iOS turns the
+display off after the lock-screen idle timeout and then ignores touches,
+while a5fb_keep_on keeps the picture on the panel; the A51 has no key driver
+yet to press the side button. SweetFramebuffer records iOS's last
+RequestPowerChange in sweet_fb_ios_display_off (even when the request is
+ignored), and the A51 touch driver turns a new touch-down while it is set
+into a power-key press/release through SweetHIDButtons (sweet_hid_key(0)),
+swallowing that contact until it lifts.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 57892eb..9cc2a29 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -393,6 +393,12 @@ sweet_fb_trigger(void)
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++extern "C" {
++int sweet_fb_ios_display_off;   /* iOS's last RequestPowerChange: 1 = off */
++}
++#endif
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -664,6 +670,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			/* What iOS believes, even when a5fb_keep_on keeps the panel lit:
++			 * it ignores touches while it thinks the display is off (A51 boot
++			 * 32), so the touch driver wakes it (a5xelte_touch.c). */
++			sweet_fb_ios_display_off = off;
+ 			int keep_on = 0;
+ 			if (off && PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on)) && keep_on) {
+ 				IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 15cf1da..54721ab 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -961,6 +961,7 @@ dreamlte_touch_start(void)
+ static vm_offset_t a51ts_iic, a51ts_gpio, a51ts_alive;
+ static int a51ts_sleep;
+ static bool a51ts_down[A51TS_FINGERS];
++static bool a51ts_swallow[A51TS_FINGERS];     /* wake touch, until lift */
+ static uint16_t a51ts_x[A51TS_FINGERS], a51ts_y[A51TS_FINGERS];
+ static uint32_t a51ts_moves[A51TS_FINGERS];      /* samples since down */
+ static uint64_t a51ts_t0[A51TS_FINGERS];         /* mach time of down */
+@@ -1060,6 +1061,8 @@ a51ts_write(const uint8_t *w, unsigned wlen)
+ }
+ 
+ static unsigned a51ts_retries, a51ts_lost, a51ts_total_moves;
++extern int sweet_fb_ios_display_off;            /* SweetFramebuffer.cpp */
++extern void sweet_hid_key(int key, int down);   /* SweetHID.cpp: 0 = power */
+ 
+ /* Like mms_i2c_read()/sec_ts_i2c_read(): retry a failed read (the S7 port's
+  * swipe-up only completed once lost reads stopped dropping move events). */
+@@ -1097,6 +1100,27 @@ a51ts_report(const uint8_t *p)
+ 	/* 12-bit panel coordinates onto SweetHIDTouch's 1080x1920 grid. */
+ 	unsigned x = (((unsigned)p[1] << 4) | (p[3] >> 4)) * 1080u / 4096u;
+ 	unsigned y = (((unsigned)p[2] << 4) | (p[3] & 0x0fu)) * 1920u / 4096u;
++	/*
++	 * iOS turns the display "off" after the lock-screen idle timeout and then
++	 * ignores touches; a5fb_keep_on keeps the picture, and there is no button
++	 * driver yet (boot 32: every swipe came right after a display-off
++	 * request). Wake it like the side button would and swallow that touch.
++	 */
++	if (a51ts_swallow[id]) {
++		if (state == 3) {
++			a51ts_swallow[id] = false;
++		}
++		return;
++	}
++	if (state == 1 && !a51ts_down[id] && sweet_fb_ios_display_off) {
++		printf("A51 TOUCH: display off in iOS: power key to wake\n");
++		sweet_fb_ios_display_off = 0;
++		a51ts_swallow[id] = true;
++		sweet_hid_key(0, 1);
++		delay(50000);
++		sweet_hid_key(0, 0);
++		return;
++	}
+ 	if (state == 1 || state == 2) {
+ 		if (!a51ts_down[id]) {
+ 			printf("A51 TOUCH: down id=%d x=%u y=%u type=%u\n", id, x, y, type);

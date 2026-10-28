@@ -15,12 +15,23 @@ fi
 
 mac=02:00:5e:77:ee:01
 echo "waiting for the phone's USB Ethernet ($mac)..." >&2
-until ip -o link | grep -qi "$mac"; do sleep 1; done
-ifname=$(ip -o link | grep -i "$mac" | awk -F': ' '{print $2}' | cut -d@ -f1)
-nmcli dev set "$ifname" managed no 2>/dev/null || true
-sudo ip addr replace 192.168.7.1/24 dev "$ifname"
-sudo ip link set "$ifname" up
-echo "$ifname up: 192.168.7.1 <-> phone 192.168.7.2; live log on udp/5140" >&2
+
+# Every phone reboot re-creates the interface without the address, so keep
+# re-applying it while the listener runs.
+keep_address() {
+	while true; do
+		ifname=$(ip -o link | grep -i "$mac" | awk -F': ' '{print $2}' | cut -d@ -f1 | head -1)
+		if [ -n "$ifname" ] && ! ip -o -4 addr show dev "$ifname" | grep -q 192.168.7.1/24; then
+			nmcli dev set "$ifname" managed no 2>/dev/null || true
+			sudo ip addr replace 192.168.7.1/24 dev "$ifname"
+			sudo ip link set "$ifname" up
+			echo "$ifname up: 192.168.7.1 <-> phone 192.168.7.2; live log on udp/5140" >&2
+		fi
+		sleep 1
+	done
+}
+keep_address &
+trap 'kill $! 2>/dev/null' EXIT INT TERM
 
 listen_udp() {
 	port=5140

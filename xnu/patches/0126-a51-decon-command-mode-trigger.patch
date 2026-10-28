@@ -1,0 +1,78 @@
+A51 display: trigger DECON_F after every panel copy (command mode).
+
+The A51 panel runs DECON_F in command mode (GLOBAL_CONTROL 0x133): it only
+fetches the panel memory on a software trigger. Boot 15 on a second SM-A515F
+showed backboardd presenting full 1080x2400 frames through AppleCLCD
+(SWEET FB: swap 1..7) while the panel kept S-Boot's logo, because nothing
+after S-Boot ever triggered a frame. shim/a51's dashboard reached 76 fps with
+this sequence: latch the shadow registers (SHADOW_REG_UPDATE_REQ |=
+bit31|0x3f), arm the trigger timer once (HW_SW_TRIG_CONTROL |= bit3|bit2),
+then pulse SW_TRIG_EN (bit 8) after each copy. The panel memory is mapped
+write-combined (SweetSurface kIOMapWriteCombineCache), so a DSB before the
+trigger is enough.
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 601a5bc..57892eb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -349,6 +349,50 @@ sweet_fb_wait_frame_done(void)
+ }
+ #endif
+ 
++#if defined(A51)
++/*
++ * The A51 panel runs DECON_F in command mode (GLOBAL_CONTROL 0x133): it only
++ * fetches the panel memory on a software trigger, so without one the panel
++ * keeps showing S-Boot's logo whatever is copied into it. Same sequence the
++ * shim/a51 dashboard used for 76 fps: latch the shadow registers, arm the
++ * trigger timer once, then pulse SW_TRIG_EN after each copy.
++ */
++#define DECON_SHADOW_REG_UPDATE_REQ     0x60
++#define DECON_HW_SW_TRIG_CONTROL        0x70
++#define DECON_SW_TRIG_EN                (1u << 8)
++#define DECON_HW_SW_TRIG_TIMER_CLEAR    (1u << 3)
++#define DECON_HW_SW_TRIG_TIMER_EN       (1u << 2)
++#define DECON_SHADOW_GLOBAL_ALL         ((1u << 31) | 0x3fu)
++
++static uint64_t sweet_fb_triggers;
++
++static void
++sweet_fb_trigger(void)
++{
++	static bool armed;
++	if (sweet_fb_decon == 0) {
++		return;
++	}
++	volatile uint32_t *shadow = (volatile uint32_t *)(sweet_fb_decon + DECON_SHADOW_REG_UPDATE_REQ);
++	volatile uint32_t *trig = (volatile uint32_t *)(sweet_fb_decon + DECON_HW_SW_TRIG_CONTROL);
++	/* The panel memory is write-combined: drain it before the fetch. */
++	__builtin_arm_dsb(0xf);      /* DSB SY */
++	if (!armed) {
++		armed = true;
++		*shadow |= DECON_SHADOW_GLOBAL_ALL;
++		*trig |= DECON_HW_SW_TRIG_TIMER_CLEAR | DECON_HW_SW_TRIG_TIMER_EN;
++		IOLog("SWEET FB: A51 command-mode trigger armed (trig 0x%x)\n", *trig);
++	}
++	uint32_t v = *trig;
++	*trig = v | DECON_SW_TRIG_EN;
++	*trig = v & ~DECON_SW_TRIG_EN;
++	*shadow |= DECON_SHADOW_GLOBAL_ALL;
++	if ((++sweet_fb_triggers % 500) == 1) {
++		IOLog("SWEET FB: %llu panel triggers\n", sweet_fb_triggers);
++	}
++}
++#endif
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -479,6 +523,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++#if defined(A51)
++	sweet_fb_trigger();
++#endif
+ 	IOLockUnlock(fPresentLock);
+ }
+ 
