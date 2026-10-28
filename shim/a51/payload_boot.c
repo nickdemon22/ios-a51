@@ -89,6 +89,53 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/* Dead-man timer (deadman.S): CPU1 forces a warm recovery reset this long
+ * after the handoff, so a hung kernel still leaves its log readable. */
+#ifndef DEADMAN_FALLBACK_MS
+#define DEADMAN_FALLBACK_MS	10000UL
+#endif
+#ifndef DEADMAN_MS
+#define DEADMAN_MS		60000UL
+#endif
+#define DEADMAN_MPIDR		0x1UL
+#define TIMER_HZ		26000000UL
+#define PSCI_CPU_ON_64		0xc4000003UL
+
+extern void deadman_entry(void);
+extern volatile uint64_t deadman_alive[8];
+extern volatile uint64_t deadman_deadline_cell;
+
+static int64_t psci_cpu_on(uint64_t mpidr, uint64_t entry, uint64_t ctx)
+{
+	register uint64_t x0 __asm__("x0") = PSCI_CPU_ON_64;
+	register uint64_t x1 __asm__("x1") = mpidr;
+	register uint64_t x2 __asm__("x2") = entry;
+	register uint64_t x3 __asm__("x3") = ctx;
+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "memory");
+	return (int64_t)x0;
+}
+
+#define GICD_CTLR		0x12301000UL
+
+static void start_deadman(void)
+{
+	uint64_t now;
+	/* S-Boot leaves the GIC-400 distributor off (GICD_CTLR = 0), and with
+	 * it off CPU_ON returns 0 but the core never runs (boot 11g; with it on,
+	 * boot 11h). Both CPUs keep DAIF masked, and XNU re-initialises the GIC. */
+	rkv("gicd_ctlr_before", *(volatile uint32_t *)GICD_CTLR);
+	*(volatile uint32_t *)GICD_CTLR = 3;
+	__asm__ volatile("dsb sy" ::: "memory");
+	rkv("gicd_ctlr_after", *(volatile uint32_t *)GICD_CTLR);
+	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+	const uint64_t deadline = now + DEADMAN_MS * (TIMER_HZ / 1000UL);
+	deadman_deadline_cell = deadline;
+	__asm__ volatile("dsb sy" ::: "memory");
+	rkv("deadman_deadline", deadline);
+	rkv("deadman_psci_ret",
+	    (uint64_t)psci_cpu_on(DEADMAN_MPIDR, (uintptr_t)deadman_entry, deadline));
+}
+
 int payload_present(uintptr_t fdt, uint64_t *rd_start_out)
 {
 	uint64_t rd_start, rd_end;
@@ -191,12 +238,55 @@ int payload_boot(uintptr_t fdt)
 	ba->bootFlags = 0;
 	ba->memSizeActual = p->mem_size;
 
+#ifdef DEADMAN_ONLY
+	/* Test build: prove the dead-man reset without entering the kernel. If
+	 * CPU1 never fires, the boot CPU runs the same reset itself
+	 * DEADMAN_FALLBACK_MS later, so the report always comes back through a
+	 * warm reset. */
+	start_deadman();
+	{
+		uint64_t t0, t;
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t0));
+		do
+			__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+		while (deadman_alive[0] == 0 && t - t0 < 2UL * TIMER_HZ);
+		rkv("cpu1_alive_magic", deadman_alive[0]);
+		rkv("cpu1_currentel", deadman_alive[1]);
+		rkv("cpu1_cntpct", deadman_alive[2]);
+		rkv("cpu1_sctlr", deadman_alive[3]);
+		rkv("cpu1_mpidr", deadman_alive[4]);
+		rkv("boot_cntpct_after_wait", t);
+		rkv("cpu1_heartbeat_2s", deadman_alive[5]);
+		rkv("cpu1_stage_2s", deadman_alive[6]);
+		while (t - t0 < 8UL * TIMER_HZ)
+			__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(t));
+		rkv("boot_cntpct_8s", t);
+		rkv("cpu1_heartbeat_8s", deadman_alive[5]);
+		rkv("cpu1_stage_8s", deadman_alive[6]);
+		rkv("cpu1_x0_at_entry", deadman_alive[7]);
+	}
+	append_marker("deadman armed, not jumping");
+	emit_report();
+	{
+		uint64_t now;
+		__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(now));
+		deadman_deadline_cell = now + (DEADMAN_MS + DEADMAN_FALLBACK_MS) * (TIMER_HZ / 1000UL);
+		__asm__ volatile("dsb sy" ::: "memory");
+		deadman_entry();
+	}
+#endif
 	append_marker("jumping to XNU");
 	emit_report();
 	log_field(20, 10);
 
 	const uintptr_t entry_pa = (uintptr_t)(p->entry_va + pa_of_va_base);
 	rkv("entry_pa", entry_pa);
+
+	/* Armed last, after the final report write, so a short DEADMAN_MS
+	 * measures the kernel alone. Its rkv lines are not emitted. */
+#ifndef DEADMAN_ONLY
+	start_deadman();
+#endif
 
 	/* Everything was written with the MMU and caches off; drop stale
 	 * I-cache lines so the kernel's own text is what we just copied. */
